@@ -3,7 +3,8 @@ import signal
 from random import randbytes
 from pathlib import Path  # if you haven't already done so
 import socket
-
+import threading
+from redis.exceptions import AuthenticationError
 file = Path(__file__).resolve()
 parent, root = file.parent, file.parents[1]
 sys.path.append(str(root))
@@ -47,9 +48,25 @@ parser.add_argument("--storage-size", required=False, default="30")
 parser.add_argument("--tls", action="store_true")
 parser.add_argument("--rdb-config", required=False, default="medium")
 parser.add_argument("--aof-config", required=False, default="always")
-parser.add_argument("--persist-instance-on-fail",action="store_true")
+parser.add_argument("--host-count", required=False, default="6")
+parser.add_argument("--cluster-replicas", required=False, default="1")
+
+parser.add_argument("--ensure-mz-distribution", action="store_true")
 parser.add_argument("--custom-network", required=False)
 parser.add_argument("--network-type", required=False, default="PUBLIC")
+
+
+parser.add_argument(
+    "--deployment-create-timeout-seconds", required=False, default=2600, type=int
+)
+parser.add_argument(
+    "--deployment-delete-timeout-seconds", required=False, default=2600, type=int
+)
+parser.add_argument(
+    "--deployment-failover-timeout-seconds", required=False, default=2600, type=int
+)
+
+parser.add_argument("--persist-instance-on-fail",action="store_true")
 
 parser.set_defaults(tls=False)
 args = parser.parse_args()
@@ -134,9 +151,24 @@ def test_change_password():
             logging.error(f"DNS resolution failed: {e}")
             raise Exception("Instance endpoint not ready: DNS resolution failed") from e
         # Change password
+        
+        is_cluster = args.resource_key != "standalone"
+        
+        if is_cluster:
+            thread_signal = threading.Event()
+            error_signal = threading.Event()
+            thread = threading.Thread(
+            target=test_zero_downtime, args=(thread_signal, error_signal, instance, args.tls, instance.falkordb_password)
+            )
+            thread.start()
+
         change_password(instance=instance, password=instance.falkordb_password)
         # Test connectivity after password change
         test_connectivity_after_password_change(instance=instance, password=instance.falkordb_password)
+        
+        if is_cluster:
+            thread_signal.set()
+            thread.join()
     except Exception as e:
         logging.exception(e)
         if not args.persist_instance_on_fail:
@@ -155,12 +187,12 @@ def change_password(instance: OmnistrateFleetInstance, password: str):
         instance: The OmnistrateFleetInstance to change the password for
         password: The new password to set
     """
-    logging.info("Password changed successfully")
     instance.update_params(
         falkordbPassword=password + "abc",
         wait_for_ready=True,
     )
     instance.falkordb_password = password + "abc"
+    logging.info("Password changed successfully")
 
 def test_connectivity_after_password_change(instance: OmnistrateFleetInstance, password: str):
     """Test Connectivity between nodes after password change by creating different keys."""
@@ -173,6 +205,38 @@ def test_connectivity_after_password_change(instance: OmnistrateFleetInstance, p
         logging.error(e)
     
     logging.info("Connectivity test passed")
+
+def test_zero_downtime(
+    thread_signal: threading.Event,
+    error_signal: threading.Event,
+    instance: OmnistrateFleetInstance,
+    password: str,
+    ssl=False,
+):
+    """This function should test the ability to read and write while a memory update happens"""
+    count = 0
+    try:
+
+        db = instance.create_connection(ssl=ssl, force_reconnect=True)
+
+        graph = db.select_graph("test")
+
+        while not thread_signal.is_set():
+            # Write some data to the DB
+            graph.query("CREATE (n:Person {name: 'Alice'})")
+            graph.ro_query("MATCH (n:Person {name: 'Alice'}) RETURN n")
+            time.sleep(3)
+    except Exception as e:
+        logging.exception(e)
+        if isinstance(e, AuthenticationError) and count <= 5:
+            count += 1
+            time.sleep(5)
+            instance.falkordb_password = password + "abc"
+            db = instance.create_connection(ssl=ssl, force_reconnect=True)
+        else:
+            error_signal.set()
+            raise e
+    
 
 def resolve_hostname(instance: OmnistrateFleetInstance,timeout=300, interval=1):
     """Check if the instance's main endpoint is resolvable.
